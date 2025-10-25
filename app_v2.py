@@ -1,133 +1,163 @@
 import os
+import re
 import csv
+import io
 import traceback
+import base64
+from datetime import datetime
 from flask import Flask, request, jsonify
-from pymongo import MongoClient, errors
+from pymongo import MongoClient
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# 初始化 Flask
+# ---------------------------------------
+# 🔧 Flask 初始化
+# ---------------------------------------
 app = Flask(__name__)
 
-# 取得環境變數
+# ---------------------------------------
+# 🔧 環境變數
+# ---------------------------------------
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB", "tsmc_ai")
-MONGO_COL = os.getenv("MONGO_COLLECTION", "lot_scrap_records")
+MONGO_DB = "tsmc_ai"
+MONGO_COL = "lot_scrap_records"
 
-# ======== MongoDB 連線偵錯區 ========
-@app.route("/debug/mongo", methods=["GET"])
-def debug_mongo():
-    result = {"uri": MONGO_URI, "db": MONGO_DB, "collection": MONGO_COL}
-    try:
-        if not MONGO_URI:
-            raise ValueError("MONGO_URI 未設定")
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    raise RuntimeError("LINE token/secret 尚未在環境變數設定")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI 尚未設定")
 
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        info = client.server_info()  # 測試實際連線
-        db = client[MONGO_DB]
-        col = db[MONGO_COL]
-        count = col.estimated_document_count()
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client[MONGO_DB]
+col = db[MONGO_COL]
 
-        result.update({
-            "status": "success",
-            "server_info": info.get("version", "unknown"),
-            "record_count": count
-        })
-    except errors.ServerSelectionTimeoutError as e:
-        result.update({
-            "status": "timeout",
-            "error": str(e)
-        })
-    except Exception as e:
-        result.update({
-            "status": "error",
-            "error": traceback.format_exc()
-        })
-    return jsonify(result)
-# ====================================
-
-
+# ---------------------------------------
+# 🧩 上傳 CSV
+# ---------------------------------------
 @app.route("/admin/upload_csv", methods=["POST"])
 def upload_csv():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "未上傳檔案"}), 400
+            return jsonify({"error": "no file uploaded"}), 400
 
         file = request.files["file"]
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        col = db[MONGO_COL]
+        if not file.filename.endswith(".csv"):
+            return jsonify({"error": "only CSV accepted"}), 400
 
-        reader = csv.DictReader(file.stream.read().decode("utf-8-sig").splitlines())
+        stream = io.StringIO(file.stream.read().decode("utf-8"))
+        reader = csv.DictReader(stream)
         data = list(reader)
+
         if not data:
-            return jsonify({"error": "CSV 為空"}), 400
+            return jsonify({"error": "CSV is empty"}), 400
 
-        # 批次寫入
-        col.insert_many(data)
+        for row in data:
+            for k, v in row.items():
+                if isinstance(v, str) and v.strip().isdigit():
+                    row[k] = int(v)
+        if data:
+            col.insert_many(data)
+
         return jsonify({"inserted": len(data)})
+
     except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "trace": traceback.format_exc()
-        }), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"status": "ok", "message": "TSMC Linebot AI Service running"})
+# ---------------------------------------
+# 🧩 LINE Webhook
+# ---------------------------------------
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("Webhook Error:", e)
+    return "OK"
 
-# ------------------------------------------------------
-# Debug: 查詢測試端點（模擬 Line 問答）
-# ------------------------------------------------------
-import re
 
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_text = event.message.text.strip()
+    reply_text = handle_query(user_text)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+
+# ---------------------------------------
+# 🧩 查詢核心邏輯
+# ---------------------------------------
+def handle_query(user_text: str) -> str:
+    match = re.search(r"(M\d+)", user_text)
+    step = match.group(1) if match else None
+
+    query = {}
+    if step:
+        query["Step"] = step
+
+    docs = list(col.find(query).limit(5))
+    if not docs:
+        return f"找不到 {step or '相關'} 的報廢紀錄"
+
+    summary = []
+    for d in docs:
+        summary.append(
+            f"{d.get('Lot ID','?')} / {d.get('Defect Type','?')} / {d.get('Date','?')}"
+        )
+
+    return f"找到 {len(docs)} 筆 {step or '相關'} 的報廢資料：\n" + "\n".join(summary)
+
+
+# ---------------------------------------
+# 🧩 Debug: 查詢端點（Base64 安全）
+# ---------------------------------------
 @app.route("/debug/query", methods=["POST"])
 def debug_query():
     try:
         data = request.get_json(force=True)
-        user_text = data.get("text", "").strip()
+        raw_text = data.get("text", "").strip()
 
-        if not user_text:
-            return jsonify({"error": "missing text"}), 400
+        # 支援 Base64 中文
+        try:
+            user_text = base64.b64decode(raw_text).decode("utf-8")
+        except Exception:
+            user_text = raw_text
 
-        match = re.search(r"(M\d+)", user_text)
-        step = match.group(1) if match else None
-
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        col = db[MONGO_COL]
-
-        query = {}
-        if step:
-            query["Step"] = step
-
-        docs = list(col.find(query).limit(5))
-        if not docs:
-            return jsonify({
-                "input": user_text,
-                "reply": f"找不到 {step or '相關'} 的報廢紀錄"
-            })
-
-        summaries = []
-        for d in docs:
-            summaries.append({
-                "Lot ID": d.get("Lot ID"),
-                "Product": d.get("Product"),
-                "Step": d.get("Step"),
-                "Defect Type": d.get("Defect Type"),
-                "Date": d.get("Date")
-            })
-
-        return jsonify({
-            "input": user_text,
-            "reply": f"找到 {len(docs)} 筆 {step or '相關'} 的報廢資料",
-            "samples": summaries
-        })
+        reply = handle_query(user_text)
+        return jsonify({"input": user_text, "reply": reply})
 
     except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "trace": traceback.format_exc()
-        }), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+
+# ---------------------------------------
+# 🧩 Debug: MongoDB 狀態
+# ---------------------------------------
+@app.route("/debug/mongo")
+def debug_mongo():
+    try:
+        count = col.count_documents({})
+        server_info = mongo_client.server_info()
+        return jsonify({
+            "status": "success",
+            "db": MONGO_DB,
+            "collection": MONGO_COL,
+            "record_count": count,
+            "server_info": server_info.get("version", "unknown"),
+            "uri": MONGO_URI
+        })
+    except Exception as e:
+        return jsonify({"status": "fail", "error": str(e)}), 500
+
+
+# ---------------------------------------
+# 🚀 主程式入口
+# ---------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    print("Starting Flask server...")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
