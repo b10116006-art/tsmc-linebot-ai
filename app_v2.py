@@ -75,6 +75,59 @@ def upload_csv():
 def index():
     return jsonify({"status": "ok", "message": "TSMC Linebot AI Service running"})
 
+# ------------------------------------------------------
+# Debug: 查詢測試端點（模擬 Line 問答）
+# ------------------------------------------------------
+import re
+
+@app.route("/debug/query", methods=["POST"])
+def debug_query():
+    try:
+        data = request.get_json(force=True)
+        user_text = data.get("text", "").strip()
+
+        if not user_text:
+            return jsonify({"error": "missing text"}), 400
+
+        match = re.search(r"(M\d+)", user_text)
+        step = match.group(1) if match else None
+
+        client = MongoClient(MONGO_URI)
+        db = client[MONGO_DB]
+        col = db[MONGO_COL]
+
+        query = {}
+        if step:
+            query["Step"] = step
+
+        docs = list(col.find(query).limit(5))
+        if not docs:
+            return jsonify({
+                "input": user_text,
+                "reply": f"找不到 {step or '相關'} 的報廢紀錄"
+            })
+
+        summaries = []
+        for d in docs:
+            summaries.append({
+                "Lot ID": d.get("Lot ID"),
+                "Product": d.get("Product"),
+                "Step": d.get("Step"),
+                "Defect Type": d.get("Defect Type"),
+                "Date": d.get("Date")
+            })
+
+        return jsonify({
+            "input": user_text,
+            "reply": f"找到 {len(docs)} 筆 {step or '相關'} 的報廢資料",
+            "samples": summaries
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "trace": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
