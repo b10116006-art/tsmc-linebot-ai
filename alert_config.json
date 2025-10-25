@@ -1,0 +1,10 @@
+{
+  "smtp_user": "tsmc.ai.alert@gmail.com",
+  "smtp_pass": "rzeqmjfkegfgachm",
+  "smtp_server": "smtp.gmail.com",
+  "smtp_port": 587,
+  "threshold": 10,
+  "period_days": 7,
+  "notify_time": "09:00",
+  "brand_watermark": "TSMC AI AutoPipeline System"
+}

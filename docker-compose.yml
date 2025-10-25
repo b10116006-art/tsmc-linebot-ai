@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: tsmc_mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: mongo123
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  web:
+    build: .
+    container_name: tsmc_linebot
+    ports:
+      - "5000:5000"
+    environment:
+      LINE_CHANNEL_SECRET: "36a750b5699892287d8bad53517b2543"
+      LINE_CHANNEL_ACCESS_TOKEN: "tQNWclfdZ80tDEBaZQOQOBb0Q35jA6qC9+VBvupkBh8nPV/K+vEOXy8pDKFeomtNz20tUUBg57V5b0o8l7DuHwxwDW70W5DFxpkPA9G7bPHiEHA/WtgTEdZ5X21IRGOLbnV0qjm9HpKNPu4kqNqtTwdB04t89/1O/w1cDnyilFU="
+      MONGO_URI: "mongodb://root:mongo123@mongo:27017/"
+      MONGO_DB: "tsmc_linebot"
+      PUBLIC_BASE_URL: "https://tsmc-linebot-ai.duckdns.org"
+    volumes:
+      - .:/app
+    depends_on:
+      - mongo
+
+  alert:
+    build: .
+    container_name: tsmc_alert
+    command: ["python", "alert_monitor.py"]
+    environment:
+      MONGO_URI: "mongodb://root:mongo:27017/"
+      # 本容器也會讀取 alert_config.json 中的 SMTP 與門檻
+    volumes:
+      - .:/app
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:

@@ -1,0 +1,7 @@
+flask
+gunicorn
+line-bot-sdk
+pymongo
+jieba
+langdetect
+python-dotenv
